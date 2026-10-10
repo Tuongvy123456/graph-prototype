@@ -100,7 +100,34 @@ python -m uvicorn crossgraph.api:app --host 127.0.0.1 --port 8000
 
 `data\quickstart.txt` và `data\sample.txt` là câu tổng hợp để kiểm tra kỹ thuật; chưa phải bài báo hay dữ liệu đánh giá. Với file thật, thay bằng đường dẫn đến `.txt` hoặc `.pdf` đang tồn tại; ví dụ `crossgraph ingest "D:\papers\my-paper.pdf"`. Bỏ `--no-persist` khi muốn ghi Neo4j, sau khi cấu hình Neo4j trong `.env`. Mỗi lần chạy ghi `data/runs/<run_id>.json`, kể cả lần lỗi sau khi vào pipeline. Nếu một chunk vẫn sai sau ba lượt validation hoặc Ollama trả JSON/schema không hợp lệ sau hai lần gọi, run tiếp tục xử lý các chunk khác và ghi `chunk_errors`: `partial` khi có claim hợp lệ, `failed` khi không có claim nào; CLI trả mã lỗi 2 và **không ghi Neo4j** nếu còn chunk lỗi. Lỗi JSON từ Ollama ghi thêm `done_reason` và độ dài phản hồi để chẩn đoán việc output bị cắt. Vì vậy `partial` không có nghĩa là tài liệu đã ingest đầy đủ. API `POST /ingest/text` nhận JSON `{ "text": "...", "title": "...", "persist": true }`; API còn có `GET /claims/{claim_id}`, `GET /entities/{entity_id}/neighbors`, `GET /paths/baseline?source=...&target=...&max_hops=3`. Bằng chứng claim gồm text, offset, chunk, trang, paper và đường dẫn nguồn. PDF scan không có text sẽ báo cần OCR.
 
+### Duyệt claim và cạnh trực tiếp giữa Entity
+
+Graph giữ các node `Paper`, `Chunk`, `Mention`, `Claim`, `Entity` để truy nguồn. Một claim có object và normalized predicate sau khi `accepted` có thêm cạnh `Entity -[:CLAIM_LINK]-> Entity`. Cạnh giữ `claim_id`, predicate, evidence, chunk ID, paper ID/trang và metadata review; **mỗi claim một cạnh**, không gộp bằng chứng từ nhiều bài. Truy vấn đường đi mặc định chỉ dùng các cạnh này. `needs_review` vẫn ở node Claim để người nghiên cứu kiểm tra, chưa tham gia đường đi mặc định.
+
+Trước khi duyệt, xem `evidence_text`, hai Entity, predicate/chiều quan hệ, polarity, qualifiers và bài nguồn trong Neo4j Browser hoặc `GET /claims/{claim_id}`. Lấy ID và trạng thái từ run JSON bằng PowerShell:
+
+```powershell
+$run = Get-Content ".\data\runs\YOUR_RUN_ID.json" -Raw | ConvertFrom-Json
+$run.claims | Select-Object claim_id, predicate, status, evidence_text, review_reasons
+```
+
+Sau khi đã tự kiểm tra, dùng lệnh sau trong PowerShell **hoặc cmd** (thay các giá trị trong dấu ngoặc kép):
+
+```bat
+crossgraph claim approve "claim:<id>" --reviewer "Ten nguoi duyet" --note "Da doi chieu evidence, chieu quan he va dieu kien trong paper"
+```
+
+Lệnh này cập nhật Claim và cạnh trực tiếp trong **một transaction**, giữ lý do review cũ ở `pre_review_reasons`; chạy lại cùng claim không tạo thêm cạnh. Ingest lại cùng claim cũng giữ quyết định duyệt nếu entity mapping không đổi. Run JSON cũ là lịch sử của lần extraction, không được sửa. Lệnh không cho duyệt claim thiếu object/predicate hoặc đã `rejected`; tên reviewer hiện là chuỗi tự khai, chưa có xác thực người dùng. Để xem cạnh trong Neo4j Browser:
+
+```cypher
+MATCH (a:Entity)-[r:CLAIM_LINK]->(b:Entity)
+WHERE r.claim_id = 'claim:<id>'
+RETURN a, r, b;
+```
+
 Muốn kiểm tra thao tác Neo4j mà không để lại dữ liệu tổng hợp trong graph, dùng `python scripts\verify_graph_transaction.py data\runs\<run_id>.json`. Script ghi hai lần trong một transaction, đối chiếu số node/cạnh rồi rollback; thay `<run_id>` bằng ID của lần chạy có claim.
+
+Để kiểm tra approve + ingest lại mà không đổi trạng thái graph thật, dùng `python scripts\verify_claim_approval.py data\runs\<run_id>.json`. Script duyệt thử claim có object/predicate trong transaction, kiểm tra cạnh và quyết định duyệt còn nguyên sau ingest lại, rồi rollback.
 
 So hai chế độ trên cùng file và cùng `OLLAMA_MODEL`:
 
@@ -132,6 +159,6 @@ crossgraph ingest data\sample.txt --no-persist
 
 ## Giới hạn và dữ liệu
 
-`accepted` chỉ có nghĩa qua Pydantic, offset, reference và các quy tắc đơn giản; **không** khẳng định entailment hoặc review chuyên gia. Validator chỉ tự sửa offset khi có đúng một vị trí khớp với mention text trong phạm vi lệch tối đa 3 ký tự quanh offset model trả; claim được sửa luôn vào `needs_review`, và các lần sửa nằm trong `extraction_attempts` của run JSON. Nếu có nhiều vị trí gần nhau hoặc lệch quá xa, run báo lỗi để review thay vì đoán vị trí. `needs_review` không vào cạnh retrieval. Entity resolution mặc định chỉ ghép exact name + type **trong cùng paper** để tránh tự ghép đồng âm khác nghĩa xuyên paper. Để curator xác nhận liên kết xuyên paper, đặt `ENTITY_ALIASES_FILE=aliases.json` trong `.env`; file JSON là mảng các record như `[ { "entity_type": "Method", "name": "Method A", "canonical_name": "Method A" } ]`. Chỉ các tên/loại được liệt kê mới dùng canonical ID chung; file alias cần được review trước khi dùng. PDF hai cột/bảng có thể sai thứ tự; chưa có lọc header/footer lặp hoặc nhận diện section đáng tin cậy, nên hãy kiểm tra text trích xuất và trang trước khi ingest. Chưa có OCR, auth, frontend, Leiden, vector index/embedding, PathRAG thật hoặc answer generation. Khi demo trên laptop, ưu tiên gọi API trên PC qua mạng riêng có lớp xác thực/proxy do bạn cấu hình; không công khai Ollama/Neo4j.
+`accepted` do pipeline tự gán chỉ có nghĩa qua Pydantic, offset, reference và các quy tắc đơn giản; **không** khẳng định entailment hoặc review chuyên gia. `accepted` do lệnh `claim approve` gán có thêm `reviewed_by`, `reviewed_at`, `review_note` và `pre_review_reasons` trong Neo4j; tên reviewer hiện là tự khai. Validator chỉ tự sửa offset khi có đúng một vị trí khớp với mention text trong phạm vi lệch tối đa 3 ký tự quanh offset model trả; claim được sửa luôn vào `needs_review`, và các lần sửa nằm trong `extraction_attempts` của run JSON. Nếu có nhiều vị trí gần nhau hoặc lệch quá xa, run báo lỗi để review thay vì đoán vị trí. `needs_review` không vào cạnh retrieval. Entity resolution mặc định chỉ ghép exact name + type **trong cùng paper** để tránh tự ghép đồng âm khác nghĩa xuyên paper. Để curator xác nhận liên kết xuyên paper, đặt `ENTITY_ALIASES_FILE=aliases.json` trong `.env`; file JSON là mảng các record như `[ { "entity_type": "Method", "name": "Method A", "canonical_name": "Method A" } ]`. Chỉ các tên/loại được liệt kê mới dùng canonical ID chung; file alias cần được review trước khi dùng. PDF hai cột/bảng có thể sai thứ tự; chưa có lọc header/footer lặp hoặc nhận diện section đáng tin cậy, nên hãy kiểm tra text trích xuất và trang trước khi ingest. Chưa có OCR, auth, frontend, Leiden, vector index/embedding, PathRAG thật hoặc answer generation. Khi demo trên laptop, ưu tiên gọi API trên PC qua mạng riêng có lớp xác thực/proxy do bạn cấu hình; không công khai Ollama/Neo4j.
 
 Tham khảo API: [Ollama structured outputs](https://docs.ollama.com/capabilities/structured-outputs), [GLiNER model card](https://huggingface.co/urchade/gliner_medium-v2.1), [spaCy models](https://spacy.io/usage/models), [Neo4j Python driver](https://neo4j.com/docs/python-manual/current/).

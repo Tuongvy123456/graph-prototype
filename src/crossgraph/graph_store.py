@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from neo4j import GraphDatabase
 from .schemas import Paper, Chunk, Mention, Entity, Claim
 
@@ -34,6 +35,75 @@ class GraphStore:
         with self.driver.session(database=self.database) as session:
             session.execute_write(self._write, paper, chunks, mentions, entities, claims, mapping)
 
+    def approve_claim(self, claim_id: str, reviewer: str, note: str) -> dict:
+        """Approve an existing claim and create its entity edge atomically."""
+        if not reviewer.strip() or not note.strip():
+            raise ValueError("Reviewer and review note are required")
+        with self.driver.session(database=self.database) as session:
+            return session.execute_write(
+                self._approve_claim, claim_id, reviewer.strip(), note.strip()
+            )
+
+    @staticmethod
+    def _project_claim(tx, claim_id: str) -> bool:
+        row = tx.run(
+            "MATCH (c:Claim {claim_id:$id})-[:SUBJECT]->(s:Entity) "
+            "MATCH (c)-[:OBJECT]->(o:Entity) "
+            "MATCH (c)-[:SUPPORTED_BY]->(ch:Chunk)<-[:HAS_CHUNK]-(p:Paper) "
+            "WHERE c.status='accepted' AND c.predicate IS NOT NULL "
+            "MERGE (s)-[r:CLAIM_LINK {claim_id:$id}]->(o) "
+            "SET r.predicate=c.predicate, r.raw_predicate=c.raw_predicate, "
+            "r.status=c.status, r.evidence_text=c.evidence_text, "
+            "r.evidence_start=c.evidence_start, r.evidence_end=c.evidence_end, "
+            "r.clause_json=c.clause_json, r.qualifiers_json=c.qualifiers_json, "
+            "r.chunk_id=ch.chunk_id, r.page=ch.page, "
+            "r.paper_id=p.paper_id, r.paper_title=p.title, r.source_path=p.source_path, "
+            "r.reviewed_by=c.reviewed_by, r.reviewed_at=c.reviewed_at, "
+            "r.review_note=c.review_note "
+            "RETURN r.claim_id AS claim_id",
+            id=claim_id,
+        ).single()
+        return row is not None
+
+    @staticmethod
+    def _approve_claim(tx, claim_id: str, reviewer: str, note: str) -> dict:
+        row = tx.run(
+            "MATCH (c:Claim {claim_id:$id}) "
+            "OPTIONAL MATCH (c)-[:OBJECT]->(o:Entity) "
+            "RETURN c.status AS status, c.predicate AS predicate, "
+            "c.reviewed_by AS reviewed_by, o.entity_id AS object_id",
+            id=claim_id,
+        ).single()
+        if row is None:
+            raise LookupError(f"Claim not found: {claim_id}")
+        if row["status"] == "rejected":
+            raise ValueError("Rejected claim cannot be approved")
+        if row["predicate"] is None or row["object_id"] is None:
+            raise ValueError("Direct entity edge requires a normalized predicate and object")
+        if row["reviewed_by"] is None:
+            timestamp = datetime.now(timezone.utc).isoformat()
+            tx.run(
+                "MATCH (c:Claim {claim_id:$id}) "
+                "SET c.pre_review_reasons=coalesce(c.review_reasons, []), "
+                "c.review_reasons=[], c.status='accepted', "
+                "c.reviewed_by=$reviewer, c.reviewed_at=$timestamp, c.review_note=$note",
+                id=claim_id, reviewer=reviewer, timestamp=timestamp, note=note,
+            ).consume()
+        tx.run(
+            "MATCH ()-[r:CLAIM_LINK {claim_id:$id}]->() DELETE r",
+            id=claim_id,
+        ).consume()
+        if not GraphStore._project_claim(tx, claim_id):
+            raise ValueError("Claim is missing its subject, object, chunk, or paper link")
+        result = tx.run(
+            "MATCH (c:Claim {claim_id:$id}) "
+            "RETURN c.claim_id AS claim_id, c.status AS status, "
+            "c.reviewed_by AS reviewed_by, c.reviewed_at AS reviewed_at, "
+            "c.pre_review_reasons AS pre_review_reasons",
+            id=claim_id,
+        ).single()
+        return dict(result)
+
     @staticmethod
     def _write(tx, paper, chunks, mentions, entities, claims, mapping):
         tx.run("MERGE (p:Paper {paper_id:$id}) SET p.title=$title, p.source_path=$path, p.source_hash=$hash, p.metadata_json=$metadata", id=paper.paper_id, title=paper.title, path=paper.source_path, hash=paper.source_hash, metadata=json.dumps(paper.metadata)).consume()
@@ -45,12 +115,21 @@ class GraphStore:
             tx.run("MATCH (c:Chunk {chunk_id:$chunk_id}), (e:Entity {entity_id:$entity_id}) MERGE (m:Mention {mention_id:$id}) SET m.text=$text, m.entity_type=$type, m.start=$start, m.end=$end, m.extractor=$extractor, m.score=$score MERGE (m)-[:IN_CHUNK]->(c) MERGE (m)-[:REFERS_TO]->(e)", chunk_id=m.chunk_id, entity_id=mapping[m.mention_id], id=m.mention_id, text=m.text, type=m.entity_type, start=m.start, end=m.end, extractor=m.extractor, score=m.score).consume()
         for c in claims:
             tx.run("MATCH ()-[r:CLAIM_LINK {claim_id:$id}]->() DELETE r", id=c.claim_id).consume()
+            existing = tx.run(
+                "MATCH (c:Claim {claim_id:$id})-[:SUBJECT]->(s:Entity) "
+                "OPTIONAL MATCH (c)-[:OBJECT]->(o:Entity) "
+                "RETURN c.status AS status, c.reviewed_by AS reviewed_by, "
+                "s.entity_id AS subject_id, o.entity_id AS object_id",
+                id=c.claim_id,
+            ).single()
+            if existing and existing["status"] == "accepted" and existing["reviewed_by"]:
+                if existing["subject_id"] != c.subject_entity_id or existing["object_id"] != c.object_entity_id:
+                    raise ValueError(f"Manually approved claim changed entity mapping: {c.claim_id}")
             tx.run("MATCH (c:Claim {claim_id:$id})-[r]->() WHERE type(r) IN ['SUBJECT', 'OBJECT', 'SUPPORTED_BY'] DELETE r", id=c.claim_id).consume()
-            tx.run("MATCH (ch:Chunk {chunk_id:$chunk_id}), (s:Entity {entity_id:$subject_id}) MERGE (c:Claim {claim_id:$id}) SET c.predicate=$predicate, c.raw_predicate=$raw, c.clause_json=$clause, c.qualifiers_json=$qualifiers, c.evidence_start=$start, c.evidence_end=$end, c.evidence_text=$text, c.status=$status, c.review_reasons=$reasons MERGE (c)-[:SUBJECT]->(s) MERGE (c)-[:SUPPORTED_BY]->(ch)", chunk_id=c.chunk_id, subject_id=c.subject_entity_id, id=c.claim_id, predicate=c.predicate, raw=c.raw_predicate, clause=c.clause.model_dump_json(), qualifiers=json.dumps(c.qualifiers), start=c.evidence_start, end=c.evidence_end, text=c.evidence_text, status=c.status, reasons=c.review_reasons).consume()
+            tx.run("MATCH (ch:Chunk {chunk_id:$chunk_id}), (s:Entity {entity_id:$subject_id}) MERGE (c:Claim {claim_id:$id}) SET c.predicate=$predicate, c.raw_predicate=$raw, c.clause_json=$clause, c.qualifiers_json=$qualifiers, c.evidence_start=$start, c.evidence_end=$end, c.evidence_text=$text, c.status=CASE WHEN c.reviewed_by IS NOT NULL AND c.status='accepted' THEN 'accepted' ELSE $status END, c.review_reasons=CASE WHEN c.reviewed_by IS NOT NULL AND c.status='accepted' THEN c.review_reasons ELSE $reasons END MERGE (c)-[:SUBJECT]->(s) MERGE (c)-[:SUPPORTED_BY]->(ch)", chunk_id=c.chunk_id, subject_id=c.subject_entity_id, id=c.claim_id, predicate=c.predicate, raw=c.raw_predicate, clause=c.clause.model_dump_json(), qualifiers=json.dumps(c.qualifiers), start=c.evidence_start, end=c.evidence_end, text=c.evidence_text, status=c.status, reasons=c.review_reasons).consume()
             if c.object_entity_id:
                 tx.run("MATCH (c:Claim {claim_id:$id}), (o:Entity {entity_id:$object_id}) MERGE (c)-[:OBJECT]->(o)", id=c.claim_id, object_id=c.object_entity_id).consume()
-            if c.status == "accepted" and c.object_entity_id:
-                tx.run("MATCH (s:Entity {entity_id:$subject_id}), (o:Entity {entity_id:$object_id}) MERGE (s)-[r:CLAIM_LINK {claim_id:$claim_id}]->(o) SET r.predicate=$predicate", subject_id=c.subject_entity_id, object_id=c.object_entity_id, claim_id=c.claim_id, predicate=c.predicate).consume()
+            GraphStore._project_claim(tx, c.claim_id)
 
     def query(self, cypher: str, **params):
         with self.driver.session(database=self.database) as session:
