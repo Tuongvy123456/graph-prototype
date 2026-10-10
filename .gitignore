@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+data/*
+!data/quickstart.txt
+!data/sample.txt
+models/
+*.db
+.tmp/
+.deps/
+.pip-cache/
+*.pdf
+!tests/fixtures/*.pdf

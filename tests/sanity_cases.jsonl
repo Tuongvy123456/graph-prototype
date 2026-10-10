@@ -1,0 +1,7 @@
+{"name":"active","text":"Method A outperforms Method B on Dataset D.","review":"A OUTPERFORMS B; dataset D qualifier; positive active"}
+{"name":"passive","text":"Method B is outperformed by Method A on Dataset D.","review":"A OUTPERFORMS B; passive; dataset D qualifier"}
+{"name":"negation","text":"Method A does not outperform Method B on Dataset D.","review":"negative polarity; do not assert positive outperformance"}
+{"name":"multiple_clauses","text":"Method A uses Dataset D and improves Task T performance.","review":"two clause candidates; separate evidence and predicates"}
+{"name":"svc","text":"Method A is a neural retrieval method.","review":"SVC/IS_A; grammatical complement preserved"}
+{"name":"sv","text":"Method A converges.","review":"SV event may have null object; no invented entity"}
+{"name":"pronoun","text":"Method A uses Dataset D. It improves Task T.","review":"pronoun coreference requires review; no fabricated link"}
